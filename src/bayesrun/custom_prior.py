@@ -15,53 +15,24 @@ class AbstractPrior(ABC):
         samples = self.sample(n)
         return np.mean(samples, axis=0), np.std(samples, axis=0)
     
-
-from pyabc import Distribution, RV
-class PriorJagiella2017(AbstractPrior):
+class SIRPrior(AbstractPrior):
     def __init__(self):
-        self.names = np.array(['log_division_rate', 'log_division_depth', 'log_initial_spheroid_radius', 'log_initial_quiescent_cell_fraction', 'log_ecm_production_rate', 'log_ecm_degradation_rate', 'log_ecm_division_threshold'])
+        self.names = np.array(["beta", "gamma"])
 
     def sample(self, n: int = 1) -> np.ndarray:
-        limits = {
-            'log_division_rate':(-3, -1),
-            'log_division_depth':(1, 3),
-            'log_initial_spheroid_radius':(0, 1.2),
-            'log_initial_quiescent_cell_fraction':(-5, 0),
-            'log_ecm_production_rate':(-5, 0),
-            'log_ecm_degradation_rate':(-5, 0),
-            'log_ecm_division_threshold':(-5, 0)
-        }
-        prior = Distribution(
-            **{key: RV("uniform", a, b - a) for key, (a, b) in limits.items()}
-        )
-        params = []
-        for i in tqdm(range(n)):
-            p = prior.rvs()
-            params.append(p)
-
-        return pd.DataFrame(params).to_numpy()
+        beta = np.random.uniform(0,1,n)
+        gamma = np.random.uniform(0,1,n)
+        if n == 1:
+            return np.r_[beta, gamma]
+        return np.r_[beta, gamma].reshape(n,-1)
     
-
-class PriorJagiella2017Delog(AbstractPrior):
+class SIRPriorDependency(AbstractPrior):
     def __init__(self):
-        self.names = np.array(['division_rate', 'division_depth', 'initial_spheroid_radius', 'initial_quiescent_cell_fraction', 'ecm_production_rate', 'ecm_degradation_rate', 'ecm_division_threshold'])
+        self.names = np.array(["beta", "gamma"])
 
     def sample(self, n: int = 1) -> np.ndarray:
-        limits = {
-            'division_rate':(-3, -1),
-            'division_depth':(1, 3),
-            'initial_spheroid_radius':(0, 1.2),
-            'initial_quiescent_cell_fraction':(-5, 0),
-            'ecm_production_rate':(-5, 0),
-            'ecm_degradation_rate':(-5, 0),
-            'ecm_division_threshold':(-5, 0)
-        }
-        prior = Distribution(
-            **{key: RV("uniform", 10**a, 10**b - 10**a) for key, (a, b) in limits.items()}
-        )
-        params = []
-        for i in tqdm(range(n)):
-            p = prior.rvs()
-            params.append(p)
-
-        return pd.DataFrame(params).to_numpy()
+        beta = np.random.uniform(0,1,n)
+        gamma = beta**2 + np.random.normal(-0.1,0.1,n)
+        if n == 1:
+            return np.r_[beta, gamma]
+        return np.r_[beta, gamma].reshape(n,-1)

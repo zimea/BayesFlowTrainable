@@ -47,3 +47,23 @@ class LSTMTransformer(tf.keras.Model):
             out = tf.concat([out1, out2], axis=-1)
             out = self.dense(out)
             return out
+    
+class LSTM(tf.keras.Model):
+    def __init__(self, **kwargs):
+        super(LSTM, self).__init__()
+
+        try:
+            n_summary = kwargs['n_summary']
+            hidden_size = kwargs['hidden_size']
+        except KeyError as e:
+            raise KeyError("Please provide the following keyword arguments: n_summary, hidden_size. \n" + str(e))
+        
+        self.LSTM = tf.keras.Sequential([
+            tf.keras.layers.LSTM(hidden_size),
+            tf.keras.layers.Dense(hidden_size, activation="relu"), 
+            tf.keras.layers.Dense(n_summary, activation="sigmoid")
+        ])
+    
+    def call(self, x, **kwargs):
+        out = self.LSTM(x)
+        return out

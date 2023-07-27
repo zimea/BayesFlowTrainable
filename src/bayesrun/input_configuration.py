@@ -34,19 +34,11 @@ class AbstractConfigurator(ABC):
     def __mean_unnorm__(self, data: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
         return data * std + mean
 
-class ConfiguratorJagiella2017(AbstractConfigurator):
+class SIRConfigurator(AbstractConfigurator):
     def __init__(self, data_sample: dict, prior: AbstractPrior, **kwargs):
         super().__init__(data_sample, prior)
-        self.mean_sim, self.std_sim = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
-        self.mean_growth, self.std_growth = self.data['growth_curve'].mean(axis=(0, 1), keepdims=True), self.data['growth_curve'].std(axis=(0, 1), keepdims=True)
-
+        self.sim_means, self.sim_stds = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
         self.prior_means, self.prior_stds = self.prior.estimate_mean_and_std()
-
-        try:
-            self.pos_function = kwargs['pos_function']
-            self.nr_pos_embs = kwargs['nr_positional_embeddings']
-        except KeyError:
-            print('No positional encoding function provided.')
 
         try:
             self.sim_normalization = kwargs['normalization']['simulations']
@@ -56,31 +48,32 @@ class ConfiguratorJagiella2017(AbstractConfigurator):
             self.param_normalization = NormalizationType.NONE
 
     def configure_input(self, forward_dict: dict) -> dict:
+        """Configures dictionary of prior draws and simulated data into BayesFlow format."""
+    
         out_dict = {}
-
-        forward_dict = self.normalize_input(forward_dict)
-        pp_ecmp = forward_dict['sim_data']
-        pos = self.pos_function(seq_len=pp_ecmp.shape[1])
-        pos = np.tile(pos, (pp_ecmp.shape[0], 1)).reshape((pp_ecmp.shape[0], pp_ecmp.shape[1], self.nr_pos_embs))
-        insert_encodings = tuple([2] * self.nr_pos_embs)
-        pp_ecmp = np.insert(pp_ecmp, insert_encodings, pos, axis=-1)
         
-        # Extract prior draws and z-standardize with previously computed means
-        params = forward_dict['prior_draws'].astype(np.float64)
-        params = (params - self.prior_means) / self.prior_stds
-
-        # Add to bayesflow keys
-        out_dict = {
-            'summary_conditions': (pp_ecmp, forward_dict['growth_curve']),
-            'targets': params
-        }
-
+        # standardization sim_data
+        sim_data = forward_dict['sim_data'].astype(np.float32)
+        norm_data = (sim_data - self.sim_means) / self.sim_stds
+        
+        # standardization priors
+        params = forward_dict['prior_draws'].astype(np.float32)
+        norm_params = (params - self.prior_means) / self.prior_stds
+        
+        # remove nan, inf and -inf
+        keep_idx = np.all(np.isfinite(norm_data), axis=(1, 2))
+        if not np.all(keep_idx):
+            print('Invalid value encountered...removing from batch')
+            
+        # add to dict
+        out_dict['summary_conditions'] = norm_data[keep_idx]
+        out_dict['targets'] = norm_params[keep_idx]
+        
         return out_dict
     
     def normalize_input(self, forward_dict: dict) -> dict:
         if self.sim_normalization == NormalizationType.MEAN:
             forward_dict['sim_data'] = self.__mean_norm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
-            forward_dict['growth_curve'] = self.__mean_norm__(forward_dict['growth_curve'], self.mean_growth, self.std_growth)
             return forward_dict
         print('No normalization applied.')
         return forward_dict
@@ -94,7 +87,377 @@ class ConfiguratorJagiella2017(AbstractConfigurator):
     def unnorm_input(self, forward_dict: dict) -> dict:
         if self.param_normalization == NormalizationType.MEAN:
             forward_dict['sim_data'] = self.__mean_unnorm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
-            forward_dict['growth_curve'] = self.__mean_unnorm__(forward_dict['growth_curve'], self.mean_growth, self.std_growth)
+        return forward_dict
+    
+    def unnorm_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_unnorm__(params, self.prior_means, self.prior_stds)
+        return params
+    
+class SIRConfiguratorEta(AbstractConfigurator):
+    def __init__(self, data_sample: dict, prior: AbstractPrior, **kwargs):
+        super().__init__(data_sample, prior)
+        self.prior = prior
+        self.sim_means, self.sim_stds = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
+
+        # calculate prior means and stds
+        prior_samples = self.prior.sample(1000)
+        self.prior_names = self.prior.get_names()
+        beta_idx = np.where(self.prior_names == 'beta')[0][0]
+        gamma_idx = np.where(self.prior_names == 'gamma')[0][0]
+        prior_samples[:, beta_idx] = (np.sqrt(1 + prior_samples[:, beta_idx]) - 1) / prior_samples[:, gamma_idx]
+        self.prior_means, self.prior_stds = prior_samples.mean(axis=0, keepdims=True), prior_samples.std(axis=0, keepdims=True)
+
+        try:
+            self.sim_normalization = kwargs['normalization']['simulations']
+            self.param_normalization = kwargs['normalization']['parameters']
+        except KeyError:
+            self.sim_normalization = NormalizationType.NONE
+            self.param_normalization = NormalizationType.NONE
+
+    def configure_input(self, forward_dict: dict) -> dict:
+        """Configures dictionary of prior draws and simulated data into BayesFlow format."""
+    
+        out_dict = {}
+        
+        # standardization sim_data
+        sim_data = forward_dict['sim_data'].astype(np.float32)
+        norm_data = (sim_data - self.sim_means) / self.sim_stds
+        
+        # standardization priors
+        params = forward_dict['prior_draws'].astype(np.float32)
+        prior_names = self.prior.get_names()
+        # find the index of the parameter beta in prior_names
+        beta_idx = np.where(prior_names == 'beta')[0][0]
+        gamma_idx = np.where(prior_names == 'gamma')[0][0]
+        #params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / (1/params[:, gamma_idx])
+        params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / np.sqrt(params[:, gamma_idx])
+        norm_params = (params - self.prior_means) / self.prior_stds
+        
+        # remove nan, inf and -inf
+        keep_idx = np.all(np.isfinite(norm_data), axis=(1, 2))
+        if not np.all(keep_idx):
+            print('Invalid value encountered...removing from batch')
+            
+        # add to dict
+        out_dict['summary_conditions'] = norm_data[keep_idx]
+        out_dict['targets'] = norm_params[keep_idx]
+        
+        return out_dict
+    
+    def normalize_input(self, forward_dict: dict) -> dict:
+        if self.sim_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_norm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+            return forward_dict
+        print('No normalization applied.')
+        return forward_dict
+    
+    def normalize_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_norm__(params, self.prior_means, self.prior_stds)
+        print('No normalization applied.')
+        return params
+    
+    def unnorm_input(self, forward_dict: dict) -> dict:
+        if self.param_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_unnorm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+        return forward_dict
+    
+    def unnorm_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_unnorm__(params, self.prior_means, self.prior_stds)
+        return params
+    
+class SIRConfiguratorEtaSqrt(AbstractConfigurator):
+    def __init__(self, data_sample: dict, prior: AbstractPrior, **kwargs):
+        super().__init__(data_sample, prior)
+        self.prior = prior
+        self.sim_means, self.sim_stds = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
+
+        # calculate prior means and stds
+        prior_samples = self.prior.sample(1000)
+        self.prior_names = self.prior.get_names()
+        beta_idx = np.where(self.prior_names == 'beta')[0][0]
+        gamma_idx = np.where(self.prior_names == 'gamma')[0][0]
+        prior_samples[:, beta_idx] = (np.sqrt(1 + prior_samples[:, beta_idx]) - 1) / np.sqrt(prior_samples[:, gamma_idx])
+        self.prior_means, self.prior_stds = prior_samples.mean(axis=0, keepdims=True), prior_samples.std(axis=0, keepdims=True)
+
+        try:
+            self.sim_normalization = kwargs['normalization']['simulations']
+            self.param_normalization = kwargs['normalization']['parameters']
+        except KeyError:
+            self.sim_normalization = NormalizationType.NONE
+            self.param_normalization = NormalizationType.NONE
+
+    def configure_input(self, forward_dict: dict) -> dict:
+        """Configures dictionary of prior draws and simulated data into BayesFlow format."""
+    
+        out_dict = {}
+        
+        # standardization sim_data
+        sim_data = forward_dict['sim_data'].astype(np.float32)
+        norm_data = (sim_data - self.sim_means) / self.sim_stds
+        
+        # standardization priors
+        params = forward_dict['prior_draws'].astype(np.float32)
+        prior_names = self.prior.get_names()
+        # find the index of the parameter beta in prior_names
+        beta_idx = np.where(prior_names == 'beta')[0][0]
+        gamma_idx = np.where(prior_names == 'gamma')[0][0]
+        #params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / (1/params[:, gamma_idx])
+        params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / np.sqrt(params[:, gamma_idx])
+        params = (params - self.prior_means) / self.prior_stds
+        
+        # remove nan, inf and -inf
+        keep_idx = np.all(np.isfinite(norm_data), axis=(1, 2))
+        if not np.all(keep_idx):
+            print('Invalid value encountered...removing from batch')
+            
+        # add to dict
+        out_dict['summary_conditions'] = norm_data[keep_idx]
+        out_dict['targets'] = params[keep_idx]
+        
+        return out_dict
+    
+    def normalize_input(self, forward_dict: dict) -> dict:
+        if self.sim_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_norm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+            return forward_dict
+        print('No normalization applied.')
+        return forward_dict
+    
+    def normalize_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_norm__(params, self.prior_means, self.prior_stds)
+        print('No normalization applied.')
+        return params
+    
+    def unnorm_input(self, forward_dict: dict) -> dict:
+        if self.param_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_unnorm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+        return forward_dict
+    
+    def unnorm_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_unnorm__(params, self.prior_means, self.prior_stds)
+        return params
+
+class SIRConfiguratorEtaFlow(AbstractConfigurator):
+    def __init__(self, data_sample: dict, prior: AbstractPrior, **kwargs):
+        super().__init__(data_sample, prior)
+        self.prior = prior
+        self.sim_means, self.sim_stds = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
+
+        # calculate prior means and stds
+        prior_samples = self.prior.sample(1000)
+        self.prior_names = self.prior.get_names()
+        beta_idx = np.where(self.prior_names == 'beta')[0][0]
+        gamma_idx = np.where(self.prior_names == 'gamma')[0][0]
+        prior_samples[:, beta_idx] = (np.sqrt(1 + prior_samples[:, beta_idx]) - 1) / prior_samples[:, gamma_idx]
+        self.prior_means, self.prior_stds = prior_samples.mean(axis=0, keepdims=True), prior_samples.std(axis=0, keepdims=True)
+
+        try:
+            self.sim_normalization = kwargs['normalization']['simulations']
+            self.param_normalization = kwargs['normalization']['parameters']
+        except KeyError:
+            self.sim_normalization = NormalizationType.NONE
+            self.param_normalization = NormalizationType.NONE
+
+    def configure_input(self, forward_dict: dict) -> dict:
+        """Configures dictionary of prior draws and simulated data into BayesFlow format."""
+    
+        out_dict = {}
+        
+        # standardization sim_data
+        sim_data = forward_dict['sim_data'].astype(np.float32)
+        norm_data = (sim_data - self.sim_means) / self.sim_stds
+        
+        # standardization priors
+        params = forward_dict['prior_draws'].astype(np.float32)
+        prior_names = self.prior.get_names()
+        # find the index of the parameter beta in prior_names
+        beta_idx = np.where(prior_names == 'beta')[0][0]
+        gamma_idx = np.where(prior_names == 'gamma')[0][0]
+        #params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / (1/params[:, gamma_idx])
+        params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / np.sqrt(params[:, gamma_idx])
+        norm_params = (params - self.prior_means) / self.prior_stds
+        
+        # remove nan, inf and -inf
+        keep_idx = np.all(np.isfinite(norm_data), axis=(1, 2))
+        if not np.all(keep_idx):
+            print('Invalid value encountered...removing from batch')
+            
+        # add to dict
+        out_dict['summary_conditions'] = norm_data[keep_idx]
+        out_dict['parameters'] = norm_params[keep_idx]
+        
+        return out_dict
+    
+    def normalize_input(self, forward_dict: dict) -> dict:
+        if self.sim_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_norm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+            return forward_dict
+        print('No normalization applied.')
+        return forward_dict
+    
+    def normalize_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_norm__(params, self.prior_means, self.prior_stds)
+        print('No normalization applied.')
+        return params
+    
+    def unnorm_input(self, forward_dict: dict) -> dict:
+        if self.param_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_unnorm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+        return forward_dict
+    
+    def unnorm_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_unnorm__(params, self.prior_means, self.prior_stds)
+        return params
+    
+class SIRConfiguratorEtaFlowSqrt(AbstractConfigurator):
+    def __init__(self, data_sample: dict, prior: AbstractPrior, **kwargs):
+        super().__init__(data_sample, prior)
+        self.prior = prior
+        self.sim_means, self.sim_stds = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
+
+        # calculate prior means and stds
+        prior_samples = self.prior.sample(1000)
+        self.prior_names = self.prior.get_names()
+        beta_idx = np.where(self.prior_names == 'beta')[0][0]
+        gamma_idx = np.where(self.prior_names == 'gamma')[0][0]
+        prior_samples[:, beta_idx] = (np.sqrt(1 + prior_samples[:, beta_idx]) - 1) / np.sqrt(prior_samples[:, gamma_idx])
+        self.prior_means, self.prior_stds = prior_samples.mean(axis=0, keepdims=True), prior_samples.std(axis=0, keepdims=True)
+
+        try:
+            self.sim_normalization = kwargs['normalization']['simulations']
+            self.param_normalization = kwargs['normalization']['parameters']
+        except KeyError:
+            self.sim_normalization = NormalizationType.NONE
+            self.param_normalization = NormalizationType.NONE
+
+    def configure_input(self, forward_dict: dict) -> dict:
+        """Configures dictionary of prior draws and simulated data into BayesFlow format."""
+    
+        out_dict = {}
+        
+        # standardization sim_data
+        sim_data = forward_dict['sim_data'].astype(np.float32)
+        norm_data = (sim_data - self.sim_means) / self.sim_stds
+        
+        # standardization priors
+        params = forward_dict['prior_draws'].astype(np.float32)
+        prior_names = self.prior.get_names()
+        # find the index of the parameter beta in prior_names
+        beta_idx = np.where(prior_names == 'beta')[0][0]
+        gamma_idx = np.where(prior_names == 'gamma')[0][0]
+        #params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / (1/params[:, gamma_idx])
+        params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / np.sqrt(params[:, gamma_idx])
+        norm_params = (params - self.prior_means) / self.prior_stds
+        
+        # remove nan, inf and -inf
+        keep_idx = np.all(np.isfinite(norm_data), axis=(1, 2))
+        if not np.all(keep_idx):
+            print('Invalid value encountered...removing from batch')
+            
+        # add to dict
+        out_dict['summary_conditions'] = norm_data[keep_idx]
+        out_dict['parameters'] = norm_params[keep_idx]
+        
+        return out_dict
+    
+    def normalize_input(self, forward_dict: dict) -> dict:
+        if self.sim_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_norm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+            return forward_dict
+        print('No normalization applied.')
+        return forward_dict
+    
+    def normalize_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_norm__(params, self.prior_means, self.prior_stds)
+        print('No normalization applied.')
+        return params
+    
+    def unnorm_input(self, forward_dict: dict) -> dict:
+        if self.param_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_unnorm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+        return forward_dict
+    
+    def unnorm_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_unnorm__(params, self.prior_means, self.prior_stds)
+        return params
+    
+class SIRConfiguratorEtaFlowSqrtNoise(AbstractConfigurator):
+    def __init__(self, data_sample: dict, prior: AbstractPrior, **kwargs):
+        super().__init__(data_sample, prior)
+        self.prior = prior
+        self.sim_means, self.sim_stds = self.data['sim_data'].mean(axis=(0, 1), keepdims=True), self.data['sim_data'].std(axis=(0, 1), keepdims=True)
+
+        # calculate prior means and stds
+        prior_samples = self.prior.sample(1000)
+        self.prior_names = self.prior.get_names()
+        beta_idx = np.where(self.prior_names == 'beta')[0][0]
+        gamma_idx = np.where(self.prior_names == 'gamma')[0][0]
+        prior_samples[:, beta_idx] = (np.sqrt(1 + prior_samples[:, beta_idx]) - 1) / np.sqrt(prior_samples[:, gamma_idx])
+        self.prior_means, self.prior_stds = prior_samples.mean(axis=0, keepdims=True), prior_samples.std(axis=0, keepdims=True)
+
+        try:
+            self.sim_normalization = kwargs['normalization']['simulations']
+            self.param_normalization = kwargs['normalization']['parameters']
+        except KeyError:
+            self.sim_normalization = NormalizationType.NONE
+            self.param_normalization = NormalizationType.NONE
+
+    def configure_input(self, forward_dict: dict) -> dict:
+        """Configures dictionary of prior draws and simulated data into BayesFlow format."""
+    
+        out_dict = {}
+        
+        # standardization sim_data
+        sim_data = forward_dict['sim_data'].astype(np.float32)
+        norm_data = (sim_data - self.sim_means) / self.sim_stds
+        
+        # standardization priors
+        params = forward_dict['prior_draws'].astype(np.float32)
+        prior_names = self.prior.get_names()
+        # find the index of the parameter beta in prior_names
+        beta_idx = np.where(prior_names == 'beta')[0][0]
+        gamma_idx = np.where(prior_names == 'gamma')[0][0]
+        #params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / (1/params[:, gamma_idx])
+        params[:, beta_idx] = (np.sqrt(1 + params[:, beta_idx]) - 1) / np.sqrt(params[:, gamma_idx])
+        norm_params = (params - self.prior_means) / self.prior_stds
+        norm_params = norm_params + np.random.normal((-1)*self.prior_stds, self.prior_stds)
+        
+        # remove nan, inf and -inf
+        keep_idx = np.all(np.isfinite(norm_data), axis=(1, 2))
+        if not np.all(keep_idx):
+            print('Invalid value encountered...removing from batch')
+            
+        # add to dict
+        out_dict['summary_conditions'] = norm_data[keep_idx]
+        out_dict['parameters'] = norm_params[keep_idx]
+        
+        return out_dict
+    
+    def normalize_input(self, forward_dict: dict) -> dict:
+        if self.sim_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_norm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
+            return forward_dict
+        print('No normalization applied.')
+        return forward_dict
+    
+    def normalize_params(self, params: np.ndarray) -> np.ndarray:
+        if self.param_normalization == NormalizationType.MEAN:
+            return self.__mean_norm__(params, self.prior_means, self.prior_stds)
+        print('No normalization applied.')
+        return params
+    
+    def unnorm_input(self, forward_dict: dict) -> dict:
+        if self.param_normalization == NormalizationType.MEAN:
+            forward_dict['sim_data'] = self.__mean_unnorm__(forward_dict['sim_data'], self.mean_sim, self.std_sim)
         return forward_dict
     
     def unnorm_params(self, params: np.ndarray) -> np.ndarray:
