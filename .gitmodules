@@ -1,3 +1,4 @@
 [submodule "BayesFlow"]
 	path = BayesFlow
 	url = git@github.com:stefanradev93/BayesFlow.git
+	branch = Development
